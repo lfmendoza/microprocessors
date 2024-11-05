@@ -20,64 +20,71 @@ size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
 
 // Macro para verificar errores de CUDA
 #define cudaCheckError(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true){
-   if (code != cudaSuccess){
-      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
+   if (code != cudaSuccess) {
+      fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
       if (abort) exit(code);
    }
 }
 
-// Kernel para calcular la suma (reducción)
-__global__ void reduceSum(float* input, float* output, int N) {
+// Kernel para calcular la suma
+__global__ void reduceSumOptimized(float* input, float* output, int N) {
     extern __shared__ float sdata[];
     unsigned int tid = threadIdx.x;
-    unsigned int i = blockIdx.x*(blockDim.x*2) + threadIdx.x;
-
-    float sum = 0;
-    if (i < N)
-        sum += input[i];
-    if (i + blockDim.x < N)
-        sum += input[i + blockDim.x];
-    sdata[tid] = sum;
+    unsigned int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
+    
+    // Memoria compartida
+    sdata[tid] = (i < N ? input[i] : 0) + (i + blockDim.x < N ? input[i + blockDim.x] : 0);
     __syncthreads();
 
     // Reducción en memoria compartida
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1){
-        if (tid < s)
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
             sdata[tid] += sdata[tid + s];
+        }
         __syncthreads();
     }
 
-    // Escribir resultado del bloque
+    // Write the result of this block to global memory
     if (tid == 0) output[blockIdx.x] = sdata[0];
 }
 
-// Kernel para ordenar usando Bubble Sort
-__global__ void bubbleSortKernel(float* data, int N) {
-    // Hilo realiza el ordenamiento
-    if (threadIdx.x == 0 && blockIdx.x == 0){
-        for (int i = 0; i < N - 1; ++i){
-            for (int j = 0; j < N - i - 1; ++j){
-                if (data[j] > data[j + 1]){
-                    float temp = data[j];
-                    data[j] = data[j + 1];
-                    data[j + 1] = temp;
+// Kernel para ordenar usando ordanamiento en paralelo con Bitonic Sort
+__global__ void bitonicSort(float* data, int N) {
+    unsigned int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (tid >= N) return;
+
+    for (int k = 2; k <= N; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            unsigned int ixj = tid ^ j;
+            if (ixj > tid) {
+                if ((tid & k) == 0 && data[tid] > data[ixj]) {
+                    float temp = data[tid];
+                    data[tid] = data[ixj];
+                    data[ixj] = temp;
+                }
+                if ((tid & k) != 0 && data[tid] < data[ixj]) {
+                    float temp = data[tid];
+                    data[tid] = data[ixj];
+                    data[ixj] = temp;
                 }
             }
+            __syncthreads();
         }
     }
 }
 
 // Kernel para calcular cuantiles (mínimo, Q1, mediana, Q3, máximo)
 __global__ void computeQuantiles(float* data, int N, float* quantiles) {
-    if (threadIdx.x == 0 && blockIdx.x == 0){
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
         // Mínimo
         quantiles[0] = data[0];
+
         // Máximo
         quantiles[4] = data[N - 1];
 
         // Mediana
-        if (N % 2 == 1){
+        if (N % 2 == 1) {
             quantiles[2] = data[N / 2];
         } else {
             quantiles[2] = (data[N / 2 - 1] + data[N / 2]) / 2.0f;
@@ -85,7 +92,7 @@ __global__ void computeQuantiles(float* data, int N, float* quantiles) {
 
         // Q1 y Q3
         int mid = N / 2;
-        if (mid % 2 == 1){
+        if (mid % 2 == 1) {
             quantiles[1] = data[mid / 2];
             quantiles[3] = data[mid + mid / 2];
         } else {
@@ -104,28 +111,20 @@ int main() {
     curl = curl_easy_init();
     if(curl) {
         // ID de la hoja de Google y GID
-        string sheet_id = "1QvEpnYnAtH9mYsoq5yqj4VazvpqxICCanV5ZuOmi0yA"; // Reemplaza con tu ID
+        string sheet_id = "1QvEpnYnAtH9mYsoq5yqj4VazvpqxICCanV5ZuOmi0yA";
         string gid = "0";
-        
-        // URL de la hoja de Google en formato CSV
         string url = "https://docs.google.com/spreadsheets/d/" + sheet_id + "/export?format=csv&gid=" + gid;
-       
+
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        // Seguir redirecciones si las hay
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        // Especificar la función de escritura
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        // Pasar string para almacenar los datos
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
 
-        // Realizar la solicitud curl
         res = curl_easy_perform(curl);
-        // Verificar errores
         if(res != CURLE_OK) {
             fprintf(stderr, "curl_easy_perform() falló: %s\n", curl_easy_strerror(res));
             return 1;
         }
-        // Limpiar
         curl_easy_cleanup(curl);
     } else {
         cout << "Error al inicializar libcurl." << endl;
@@ -133,90 +132,64 @@ int main() {
     }
 
     // Procesar el contenido CSV almacenado en readBuffer
-    vector<vector<string>> datos;
-    stringstream sstream(readBuffer);
-    string linea;
-
-    // Variable para almacenar las presiones
     vector<float> pressures;
-
-    // Saltar el encabezado
+    stringstream sstream(readBuffer);
+    string line;
     bool firstLine = true;
 
-    // Leer cada línea del CSV
-    while (getline(sstream, linea)) {
-        // Saltar la primera línea de encabezado
-        if (firstLine) {
-            firstLine = false;
-            continue;
-        }
+    while (getline(sstream, line)) {
+        if (firstLine) { firstLine = false; continue; }  // Skip header
+        stringstream ss(line);
+        vector<string> row;
+        string value;
+        while (getline(ss, value, ',')) { row.push_back(value); }
 
-        stringstream ss(linea);
-        string valor;
-        vector<string> fila;
-
-        // Separar los valores por comas
-        while (getline(ss, valor, ',')) {
-            fila.push_back(valor);
-        }
-        datos.push_back(fila);
-
-        // La presión está en la tercera columna (índice 2)
-        if (fila.size() >= 3) {
-            float pressureValue = stof(fila[2]);
-            pressures.push_back(pressureValue);
+        if (row.size() >= 3) {
+            // La presión está en la tercera columna (índice 2)
+            pressures.push_back(stof(row[2]));
         }
     }
 
-    // Número de elementos
     int N = pressures.size();
+    if (N == 0) {
+        cout << "No se encontraron datos" << endl;
+        return 1;
+    }
+    cout << "Count: " << N << endl;
 
-    // Mostrar conteo
-    cout << "Conteo: " << N << endl;
-
-    // Copiar datos a memoria de dispositivo
-    float* d_pressures;
+    // Copiando la data a la GPU
+    float *d_pressures, *d_intermediate, *d_quantiles;
     cudaCheckError(cudaMalloc((void**)&d_pressures, N * sizeof(float)));
     cudaCheckError(cudaMemcpy(d_pressures, pressures.data(), N * sizeof(float), cudaMemcpyHostToDevice));
+    cudaCheckError(cudaMalloc((void**)&d_intermediate, N / 2 * sizeof(float)));
+    cudaCheckError(cudaMalloc((void**)&d_quantiles, 5 * sizeof(float)));
 
-    // Calcular suma usando reducción
+    // Reducción de la suma total
     int blockSize = 256;
     int gridSize = (N + blockSize * 2 - 1) / (blockSize * 2);
-
-    float* d_intermediate;
-    cudaCheckError(cudaMalloc((void**)&d_intermediate, gridSize * sizeof(float)));
-
-    size_t sharedMemSize = blockSize * sizeof(float);
-    reduceSum<<<gridSize, blockSize, sharedMemSize>>>(d_pressures, d_intermediate, N);
-    cudaCheckError(cudaGetLastError());
+    reduceSumOptimized<<<gridSize, blockSize, blockSize * sizeof(float)>>>(d_pressures, d_intermediate, N);
     cudaCheckError(cudaDeviceSynchronize());
 
-    // Copiar resultados intermedios al host y sumar
+    // Copiar resultado de la reducción a la CPU
     vector<float> h_intermediate(gridSize);
     cudaCheckError(cudaMemcpy(h_intermediate.data(), d_intermediate, gridSize * sizeof(float), cudaMemcpyDeviceToHost));
-
-    float totalSum = 0.0f;
-    for (int i = 0; i < gridSize; ++i) {
-        totalSum += h_intermediate[i];
+    float totalSum = 0;
+    for (float val : h_intermediate) {
+        totalSum += val;
     }
-
-    // Calcular media
     float mean = totalSum / N;
 
-    // Ordenar datos en el dispositivo
-    bubbleSortKernel<<<1,1>>>(d_pressures, N);
-    cudaCheckError(cudaGetLastError());
+    // Ordenar los datos usando Bitonic Sort
+    int numThreads = 256;
+    int numBlocks = (N + numThreads - 1) / numThreads;
+    bitonicSort<<<numBlocks, numThreads>>>(d_pressures, N);
     cudaCheckError(cudaDeviceSynchronize());
 
     // Calcular cuantiles
-    float* d_quantiles;
-    cudaCheckError(cudaMalloc((void**)&d_quantiles, 5 * sizeof(float)));
-
-    computeQuantiles<<<1,1>>>(d_pressures, N, d_quantiles);
-    cudaCheckError(cudaGetLastError());
+    computeQuantiles<<<1, 1>>>(d_pressures, N, d_quantiles);
     cudaCheckError(cudaDeviceSynchronize());
 
-    // Copiar cuantiles al host
+    // Copiar cuantiles a la CPU
     float h_quantiles[5];
     cudaCheckError(cudaMemcpy(h_quantiles, d_quantiles, 5 * sizeof(float), cudaMemcpyDeviceToHost));
 
